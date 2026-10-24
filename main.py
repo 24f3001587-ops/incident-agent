@@ -5,7 +5,7 @@ import os
 
 app = FastAPI()
 
-STORAGE_FILE = "incidents_store.json"
+STORAGE_FILE = "incidents_db.json"
 
 def load_db():
     if os.path.exists(STORAGE_FILE):
@@ -48,7 +48,6 @@ async def create_incident(payload: dict):
     allowed_causes = incident.get("allowedRootCauses", ["unknown"])
     root_cause = allowed_causes[0] if allowed_causes else "unknown"
     
-    # Pick first diagnostic tool
     tool_name = "query_metrics"
     for t in tool_catalog:
         if t["name"] not in policy.get("effectTools", []):
@@ -179,10 +178,12 @@ async def create_incident(payload: dict):
 
     db[run_id] = {
         "payload_digest": payload_digest,
+        "payload": payload,
         "state": state,
         "actionLog": dispatches,
         "receiptLog": [],
-        "otlp": otlp_trace
+        "otlp": otlp_trace,
+        "stage": "diagnostic_waiting"
     }
     save_db(db)
     return state
@@ -217,13 +218,40 @@ async def incident_receipts(run_id: str, payload: dict):
             "nonce": app_rec.get("nonce", "nonce")
         })
 
-    chosen_effect = "scale_service"
+    policy = run_data["payload"].get("policy", {})
+    effect_tools = policy.get("effectTools", ["scale_service"])
+    effect_tool = effect_tools[0] if effect_tools else "scale_service"
+    approval_required = effect_tool in policy.get("approvalRequiredFor", [])
+
+    if run_data.get("stage") == "diagnostic_waiting":
+        if approval_required and approvals == []:
+            approval_id = hashlib.sha256(f"{run_id}-app-1".encode()).hexdigest()[:16]
+            action_id = hashlib.sha256(f"{run_id}-eff-1".encode()).hexdigest()[:16]
+            args = {"service": run_data["payload"].get("incident", {}).get("service", "core")}
+            args_digest = hashlib.sha256(json.dumps(args, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+            state = {
+                "runId": run_id,
+                "status": "waiting",
+                "diagnosis": run_data["state"]["diagnosis"],
+                "dispatches": [],
+                "approvals": [{
+                    "approvalId": approval_id,
+                    "actionId": action_id,
+                    "toolName": effect_tool,
+                    "argumentsDigest": args_digest
+                }]
+            }
+            run_data["state"] = state
+            run_data["stage"] = "approval_waiting"
+            save_db(db)
+            return state
 
     completed_state = {
         "runId": run_id,
         "status": "completed",
         "diagnosis": run_data["state"]["diagnosis"],
-        "chosenEffect": chosen_effect,
+        "chosenEffect": effect_tool,
         "suppressed": [],
         "actionLog": run_data["actionLog"],
         "receiptLog": run_data["receiptLog"],
@@ -231,6 +259,7 @@ async def incident_receipts(run_id: str, payload: dict):
     }
 
     run_data["state"] = completed_state
+    run_data["stage"] = "completed"
     save_db(db)
     return completed_state
 
