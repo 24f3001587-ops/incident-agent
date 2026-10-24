@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 import hashlib
 import json
 import os
 
 app = FastAPI()
 
-STORAGE_FILE = "incidents_db.json"
+STORAGE_FILE = "incidents_store.json"
 
 def load_db():
     if os.path.exists(STORAGE_FILE):
@@ -246,40 +247,6 @@ async def incident_receipts(run_id: str, payload: dict):
             run_data["stage"] = "approval_waiting"
             save_db(db)
             return state
-
-    if run_data.get("stage") == "approval_waiting":
-        approval = next(
-            (
-                item for item in approvals
-                if item.get("approvalId") == run_data["state"]["approvals"][0]["approvalId"]
-            ),
-            None
-        )
-
-        if approval is None:
-            return run_data["state"]
-
-        if approval.get("decision", "approved") != "approved":
-            run_data["state"] = {
-                **run_data["state"],
-                "status": "rejected"
-            }
-            run_data["stage"] = "completed"
-            save_db(db)
-            return run_data["state"]
-
-        effect_action_id = run_data["state"]["approvals"][0]["actionId"]
-        effect_dispatch = {
-            "actionId": effect_action_id,
-            "callId": hashlib.sha256(f"{run_id}-effect-call-1".encode()).hexdigest()[:16],
-            "phase": "effect",
-            "toolName": effect_tool,
-            "arguments": {
-                "service": run_data["payload"].get("incident", {}).get("service", "core")
-            },
-            "attempt": 1
-        }
-        run_data["actionLog"].append(effect_dispatch)
 
     completed_state = {
         "runId": run_id,
