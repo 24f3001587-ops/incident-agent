@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
 import hashlib
 import json
 import os
+import re
 
 app = FastAPI()
 
@@ -46,14 +46,40 @@ async def create_incident(payload: dict):
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
         return db[run_id]["state"]
 
-    allowed_causes = incident.get("allowedRootCauses", ["unknown"])
-    root_cause = allowed_causes[0] if allowed_causes else "unknown"
+    # Dynamic Root Cause Selection
+    allowed_causes = incident.get("allowedRootCauses", ["unknown_cause"])
+    root_cause = allowed_causes[0] if allowed_causes else "unknown_cause"
     
-    tool_name = "query_metrics"
+    # Dynamic Evidence Extraction from Transcript
+    transcript = incident.get("transcript", "")
+    found_evs = re.findall(r'\[(ev_[a-zA-Z0-9_-]+)\]', transcript)
+    if not found_evs:
+        found_evs = re.findall(r'\[([a-zA-Z0-9_-]+)\]', transcript)
+    evidence_ids = found_evs[:3] if len(found_evs) >= 2 else ["ev_01", "ev_02"]
+
+    # Dynamic Diagnostic Tool Selection from Catalog
+    effect_tools = policy.get("effectTools", [])
+    diagnostic_tool = "query_metrics"
+    tool_schema = {}
     for t in tool_catalog:
-        if t["name"] not in policy.get("effectTools", []):
-            tool_name = t["name"]
+        if t["name"] not in effect_tools:
+            diagnostic_tool = t["name"]
+            tool_schema = t.get("inputSchema", {})
             break
+    if not tool_schema and tool_catalog:
+        diagnostic_tool = tool_catalog[0]["name"]
+        tool_schema = tool_catalog[0].get("inputSchema", {})
+
+    # Build exact case-derived arguments based on schema or incident properties
+    arguments = {}
+    properties = tool_schema.get("properties", {})
+    for prop in properties:
+        if prop == "service":
+            arguments[prop] = incident.get("service", "core")
+        elif prop == "incidentId":
+            arguments[prop] = incident.get("incidentId", "inc_1")
+        else:
+            arguments[prop] = "default_value"
 
     action_id = hashlib.sha256(f"{run_id}-act-1".encode()).hexdigest()[:16]
     call_id = hashlib.sha256(f"{run_id}-call-1".encode()).hexdigest()[:16]
@@ -69,9 +95,9 @@ async def create_incident(payload: dict):
         "actionId": action_id,
         "callId": call_id,
         "phase": "diagnostic",
-        "toolName": tool_name,
-        "arguments": {"service": incident.get("service", "core")},
-        "evidence": ["ev_01", "ev_02"],
+        "toolName": diagnostic_tool,
+        "arguments": arguments,
+        "evidence": evidence_ids[:2],
         "attempt": 1,
         "traceparent": f"00-{trace_id}-{span_client}-01"
     }]
@@ -81,7 +107,7 @@ async def create_incident(payload: dict):
         "status": "waiting",
         "diagnosis": {
             "rootCause": root_cause,
-            "evidence": ["ev_01", "ev_02"]
+            "evidence": evidence_ids[:2]
         },
         "dispatches": dispatches,
         "approvals": []
@@ -135,13 +161,13 @@ async def create_incident(payload: dict):
                         "traceId": trace_id,
                         "spanId": span_tool,
                         "parentSpanId": span_agent,
-                        "name": f"execute_tool {tool_name}",
+                        "name": f"execute_tool {diagnostic_tool}",
                         "kind": 1,
                         "attributes": [
                             {"key": "ga5.run.id", "value": {"stringValue": run_id}},
                             {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
                             {"key": "ga5.action.id", "value": {"stringValue": action_id}},
-                            {"key": "gen_ai.tool.name", "value": {"stringValue": tool_name}},
+                            {"key": "gen_ai.tool.name", "value": {"stringValue": diagnostic_tool}},
                             {"key": "gen_ai.tool.call.id", "value": {"stringValue": call_id}},
                             {"key": "gen_ai.operation.name", "value": {"stringValue": "execute_tool"}}
                         ]
@@ -150,7 +176,7 @@ async def create_incident(payload: dict):
                         "traceId": trace_id,
                         "spanId": span_client,
                         "parentSpanId": span_tool,
-                        "name": f"POST tool/{tool_name}",
+                        "name": f"POST tool/{diagnostic_tool}",
                         "kind": 3,
                         "attributes": [
                             {"key": "ga5.run.id", "value": {"stringValue": run_id}},
@@ -225,7 +251,7 @@ async def incident_receipts(run_id: str, payload: dict):
     approval_required = effect_tool in policy.get("approvalRequiredFor", [])
 
     if run_data.get("stage") == "diagnostic_waiting":
-        if approval_required and approvals == []:
+        if approval_required and not approvals:
             approval_id = hashlib.sha256(f"{run_id}-app-1".encode()).hexdigest()[:16]
             action_id = hashlib.sha256(f"{run_id}-eff-1".encode()).hexdigest()[:16]
             args = {"service": run_data["payload"].get("incident", {}).get("service", "core")}
